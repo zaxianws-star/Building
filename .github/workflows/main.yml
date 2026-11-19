@@ -1,16 +1,19 @@
+
 name: Build APK
 
 on:
   workflow_dispatch:
     inputs:
       obfuscate:
-        description: 'Acak & kecilkan kode dengan ProGuard/R8'
+        description: 'Acak dan kecilkan kode dengan ProGuard/R8'
         type: boolean
         default: false
+        required: false
       release:
-        description: 'Build release ditandatangani keystore pribadi (butuh Secrets)'
+        description: 'Build release (memerlukan konfigurasi signing)'
         type: boolean
         default: false
+        required: false
 
 permissions:
   contents: write
@@ -20,70 +23,88 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # ==========================================
+      # 1. CHECKOUT
+      # ==========================================
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # ==========================================
+      # 2. CARI DAN EKSTRAK ZIP PROJECT
+      # ==========================================
       - name: Cari dan ekstrak ZIP
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
           ZIP=$(find . -maxdepth 1 -type f -name '*.zip' | head -n1)
 
           if [ -z "$ZIP" ]; then
-            echo "ERROR: ZIP tidak ditemukan di root repo"
+            echo "ERROR: ZIP tidak ditemukan di root repository"
             exit 1
           fi
+
+          echo "ZIP ditemukan: $ZIP"
 
           mkdir -p work
           unzip -q "$ZIP" -d work
 
-          SG=$(find work -maxdepth 6 \
+          SG=$(find work -maxdepth 8 -type f \
             \( -name settings.gradle -o -name settings.gradle.kts \) \
-            -type f | head -n1)
+            | head -n1)
 
           if [ -z "$SG" ]; then
-            echo "ERROR: settings.gradle tidak ditemukan di ZIP"
+            echo "ERROR: settings.gradle tidak ditemukan"
+            find work -maxdepth 4 -type f | head -100
             exit 1
           fi
 
           PROJECT_DIR="$(dirname "$SG")"
-          echo "PROJECT_DIR=$GITHUB_WORKSPACE/$PROJECT_DIR" >> "$GITHUB_ENV"
+          PROJECT_DIR="$(realpath "$PROJECT_DIR")"
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
 
           echo "Project ditemukan: $PROJECT_DIR"
+          ls -la "$PROJECT_DIR"
 
+      # ==========================================
+      # 3. JAVA 17
+      # ==========================================
       - name: Setup Java
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
+          cache: gradle
 
+      # ==========================================
+      # 4. ANDROID SDK
+      # ==========================================
       - name: Setup Android SDK
-        env:
-          ANDROID_HOME: /usr/local/lib/android/sdk
-          ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
-          if [ ! -d "$ANDROID_HOME/cmdline-tools" ]; then
-            echo "ERROR: Folder cmdline-tools tidak ditemukan"
+          ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          ANDROID_SDK_ROOT="$ANDROID_HOME"
+
+          if [ ! -d "$ANDROID_HOME" ]; then
+            echo "ERROR: Android SDK tidak ditemukan"
             exit 1
           fi
 
           SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" \
-            -type f -name sdkmanager | head -n1)
+            -type f -name sdkmanager 2>/dev/null | head -n1)
 
           if [ -z "$SDKMANAGER" ]; then
             echo "ERROR: sdkmanager tidak ditemukan"
             exit 1
           fi
 
-          echo "Menggunakan: $SDKMANAGER"
+          echo "SDK Manager: $SDKMANAGER"
 
           yes | "$SDKMANAGER" --licenses || true
 
-          # Platform 34 WAJIB: sesuai compileSdk 34 di app/build.gradle
           "$SDKMANAGER" --install \
             "platform-tools" \
             "platforms;android-34" \
@@ -94,196 +115,289 @@ jobs:
           echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
           echo "$ANDROID_HOME/build-tools/34.0.0" >> "$GITHUB_PATH"
 
-          # Pastikan Gradle menemukan SDK
           echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
 
-          echo "Platform terpasang:"
+          echo "SDK berhasil disiapkan"
           ls "$ANDROID_HOME/platforms"
 
+      # ==========================================
+      # 5. GRADLE
+      # ==========================================
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.2'
 
-      - name: Aktifkan ProGuard/R8 (opsional)
-        if: ${{ inputs.obfuscate == 'true' || inputs.obfuscate == true }}
-        shell: python3 {0}
+      # ==========================================
+      # 6. PROGUARD / R8 OPSIONAL
+      # ==========================================
+      - name: Aktifkan ProGuard/R8
+        if: ${{ inputs.obfuscate == true }}
+        shell: bash
         run: |
-          import os, re, glob
+          set -euo pipefail
 
-          project = os.environ["PROJECT_DIR"]
-          candidates = glob.glob(os.path.join(project, "app", "build.gradle")) + \
-                       glob.glob(os.path.join(project, "app", "build.gradle.kts"))
-          if not candidates:
-              raise SystemExit("ERROR: app/build.gradle(.kts) tidak ditemukan, lewati obfuscation")
-          path = candidates[0]
+          python3 - "$PROJECT_DIR" <<'PY'
+          import os
+          import re
+          import sys
+
+          project = sys.argv[1]
+
+          candidates = [
+              os.path.join(project, "app", "build.gradle"),
+              os.path.join(project, "app", "build.gradle.kts")
+          ]
+
+          path = next((p for p in candidates if os.path.isfile(p)), None)
+
+          if not path:
+              raise SystemExit("ERROR: app/build.gradle tidak ditemukan")
+
           kts = path.endswith(".kts")
-          src = open(path, "r", encoding="utf-8").read()
 
-          pg_path = os.path.join(project, "app", "proguard-rules.pro")
-          STRICT_RULES = (
-              "-dontwarn **\n"
-              "-keep class * extends android.app.Activity\n"
-              "-keep class * extends android.app.Service\n"
-              "-keep class * extends android.content.BroadcastReceiver\n"
-              "-keep class * extends android.content.ContentProvider\n"
-              "-keepattributes *Annotation*\n"
-              "\n"
-              "# --- mode lebih ketat ---\n"
-              "-optimizationpasses 5\n"
-              "-allowaccessmodification\n"
-              "-repackageclasses ''\n"
-              "-overloadaggressively\n"
-              "-dontpreverify\n"
-              "-dontusemixedcaseclassnames\n"
-              "# buang info debug dari stack trace (nama file & nomor baris asli)\n"
-              "-renamesourcefileattribute SourceFile\n"
-              "-keepattributes !SourceFile,!LineNumberTable\n"
-              "# buang semua log saat runtime, bukan cuma disembunyikan\n"
-              "-assumenosideeffects class android.util.Log {\n"
-              "    public static *** d(...);\n"
-              "    public static *** v(...);\n"
-              "    public static *** i(...);\n"
-              "    public static *** w(...);\n"
-              "    public static *** e(...);\n"
-              "}\n"
-              "-assumenosideeffects class java.io.PrintStream {\n"
-              "    public void println(...);\n"
-              "    public void print(...);\n"
-              "}\n"
-          )
-          if os.path.exists(pg_path):
-              old = open(pg_path, "r", encoding="utf-8").read()
-              if "mode lebih ketat" not in old:
-                  with open(pg_path, "a", encoding="utf-8") as f:
-                      f.write("\n" + STRICT_RULES)
-                  print("Aturan ketat ditambahkan ke proguard-rules.pro yang sudah ada")
-          else:
-              with open(pg_path, "w", encoding="utf-8") as f:
-                  f.write(STRICT_RULES)
-              print("Dibuat: app/proguard-rules.pro (aturan ketat)")
+          with open(path, "r", encoding="utf-8") as f:
+              src = f.read()
 
-          m = re.search(r"buildTypes\s*\{", src)
-          if not m:
-              raise SystemExit("ERROR: blok buildTypes tidak ditemukan di " + path)
+          rules_path = os.path.join(project, "app", "proguard-rules.pro")
+
+          rules = """
+          -keepattributes *Annotation*
+          -keep class * extends android.app.Activity
+          -keep class * extends android.app.Service
+          -keep class * extends android.content.BroadcastReceiver
+          -keep class * extends android.content.ContentProvider
+          -keep class **.BuildConfig { *; }
+          """
+
+          if not os.path.exists(rules_path):
+              with open(rules_path, "w", encoding="utf-8") as f:
+                  f.write(rules)
+
+          match = re.search(r'buildTypes\s*\{', src)
+
+          if not match:
+              raise SystemExit("ERROR: blok buildTypes tidak ditemukan")
 
           if kts:
-              addition = (
-                  "\n            isMinifyEnabled = true\n"
-                  "            isShrinkResources = true\n"
-                  "            isDebuggable = false\n"
-                  "            isJniDebuggable = false\n"
-                  "            proguardFiles(getDefaultProguardFile(\"proguard-android-optimize.txt\"), \"proguard-rules.pro\")\n        "
-              )
-              debug_block = re.search(r"debug\s*\{([^}]*)\}", src)
-              if debug_block:
-                  body = debug_block.group(1)
-                  if "isMinifyEnabled" not in body:
-                      src = src[:debug_block.start(1)] + body + addition + src[debug_block.end(1):]
-                  else:
-                      src = src.replace("isMinifyEnabled = false", "isMinifyEnabled = true", 1)
-                      src = re.sub(r"isDebuggable\s*=\s*true", "isDebuggable = false", src, count=1)
-              else:
-                  insert_at = m.end()
-                  snippet = "\n        debug {" + addition + "}\n"
-                  src = src[:insert_at] + snippet + src[insert_at:]
+              addition = """
+                  isMinifyEnabled = true
+                  isShrinkResources = true
+                  proguardFiles(
+                      getDefaultProguardFile("proguard-android-optimize.txt"),
+                      "proguard-rules.pro"
+                  )
+              """
           else:
-              addition = (
-                  "\n            minifyEnabled true\n"
-                  "            shrinkResources true\n"
-                  "            debuggable false\n"
-                  "            jniDebuggable false\n"
-                  "            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'\n        "
-              )
-              debug_block = re.search(r"debug\s*\{([^}]*)\}", src)
-              if debug_block:
-                  body = debug_block.group(1)
-                  if "minifyEnabled" not in body:
-                      src = src[:debug_block.start(1)] + body + addition + src[debug_block.end(1):]
-                  else:
-                      src = src.replace("minifyEnabled false", "minifyEnabled true", 1)
-                      src = re.sub(r"debuggable\s+true", "debuggable false", src, count=1)
+              addition = """
+                  minifyEnabled true
+                  shrinkResources true
+                  proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+              """
+
+          debug = re.search(r'debug\s*\{([^}]*)\}', src)
+
+          if debug:
+              body = debug.group(1)
+
+              if kts:
+                  body = re.sub(r'isMinifyEnabled\s*=\s*false', '', body)
+                  body = re.sub(r'isShrinkResources\s*=\s*false', '', body)
+                  if "isMinifyEnabled" not in body:
+                      body += addition
               else:
-                  insert_at = m.end()
-                  snippet = "\n        debug {" + addition + "}\n"
-                  src = src[:insert_at] + snippet + src[insert_at:]
+                  body = re.sub(r'minifyEnabled\s+false', '', body)
+                  body = re.sub(r'shrinkResources\s+false', '', body)
+                  if "minifyEnabled" not in body:
+                      body += addition
 
-          open(path, "w", encoding="utf-8").write(src)
-          print("ProGuard/R8 mode ketat diaktifkan di:", path)
+              src = src[:debug.start(1)] + body + src[debug.end(1):]
 
-          gp_path = os.path.join(project, "gradle.properties")
-          gp = open(gp_path, "r", encoding="utf-8").read() if os.path.exists(gp_path) else ""
-          need = []
-          if "android.enableR8.fullMode" not in gp:
-              need.append("android.enableR8.fullMode=true")
-          if "android.enableResourceOptimizations" not in gp:
-              need.append("android.enableResourceOptimizations=true")
-          if need:
-              with open(gp_path, "a", encoding="utf-8") as f:
-                  f.write("\n" + "\n".join(need) + "\n")
-              print("gradle.properties diperkuat:", need)
+          else:
+              snippet = "\n        debug {" + addition + "\n        }\n"
+              src = src[:match.end()] + snippet + src[match.end():]
 
-      - name: Siapkan keystore release (hanya kalau release dipilih)
-        if: ${{ inputs.release == 'true' || inputs.release == true }}
+          with open(path, "w", encoding="utf-8") as f:
+              f.write(src)
+
+          print("R8 diaktifkan:", path)
+          PY
+
+      # ==========================================
+      # 7. VALIDASI PROJECT
+      # ==========================================
+      - name: Validasi project
         shell: bash
-        env:
-          KS_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
         run: |
-          set -e
-          if [ -z "$KS_BASE64" ]; then
-            echo "ERROR: Secret RELEASE_KEYSTORE_BASE64 belum diisi di repo (Settings > Secrets and variables > Actions)."
+          set -euo pipefail
+
+          cd "$PROJECT_DIR"
+
+          if [ ! -f gradlew ]; then
+            echo "ERROR: gradlew tidak ditemukan"
             exit 1
           fi
-          echo "$KS_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
-          echo "RELEASE_KS_PATH=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
 
+          chmod +x gradlew
+
+          echo "Project:"
+          pwd
+
+          echo "Gradle wrapper:"
+          ls -l gradlew
+
+          echo "Konfigurasi:"
+          find . -maxdepth 2 -type f \
+            \( -name build.gradle -o -name build.gradle.kts \)
+
+      # ==========================================
+      # 8. SIAPKAN LOG BUILD
+      # ==========================================
+      - name: Siapkan build log
+        shell: bash
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE"
+          touch "$GITHUB_WORKSPACE/build.log"
+          echo "Build log siap"
+
+      # ==========================================
+      # 9. BUILD APK
+      # ==========================================
       - name: Build APK
         shell: bash
-        working-directory: ${{ env.PROJECT_DIR }}
-        env:
-          RELEASE_KEYSTORE_PATH: ${{ env.RELEASE_KS_PATH }}
-          RELEASE_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
-          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
-          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
         run: |
-          set -eo pipefail
+          set -uo pipefail
+
+          cd "$PROJECT_DIR"
+
+          LOG="$GITHUB_WORKSPACE/build.log"
+
+          echo "==================================" | tee -a "$LOG"
+          echo "SUGESTER APK BUILD" | tee -a "$LOG"
+          echo "==================================" | tee -a "$LOG"
+
           if [ "${{ inputs.release }}" = "true" ]; then
-            gradle assembleRelease --stacktrace --console=plain 2>&1 | tee "$RUNNER_TEMP/build.log"
+            echo "Mode: RELEASE" | tee -a "$LOG"
+
+            set +e
+            ./gradlew assembleRelease \
+              --stacktrace \
+              --info \
+              --console=plain 2>&1 | tee -a "$LOG"
+            STATUS=${PIPESTATUS[0]}
+            set -e
           else
-            gradle assembleDebug --stacktrace --console=plain 2>&1 | tee "$RUNNER_TEMP/build.log"
+            echo "Mode: DEBUG" | tee -a "$LOG"
+
+            set +e
+            ./gradlew assembleDebug \
+              --stacktrace \
+              --info \
+              --console=plain 2>&1 | tee -a "$LOG"
+            STATUS=${PIPESTATUS[0]}
+            set -e
           fi
 
-      - name: Tampilkan ringkasan error (kalau build gagal)
-        if: failure()
+          if [ "$STATUS" -ne 0 ]; then
+            echo "BUILD FAILED: $STATUS" | tee -a "$LOG"
+            exit "$STATUS"
+          fi
+
+          echo "BUILD SUCCESS" | tee -a "$LOG"
+
+      # ==========================================
+      # 10. TAMPILKAN ERROR
+      # ==========================================
+      - name: Tampilkan ringkasan error
+        if: always()
         shell: bash
         run: |
-          echo "===== Baris penyebab error (AAPT / error: / not found) ====="
-          grep -nE "AAPT|error:|ERROR|not found|What went wrong|Caused by" "$RUNNER_TEMP/build.log" | head -60 || true
+          LOG="$GITHUB_WORKSPACE/build.log"
 
-      # APK dikirim ke tab Releases (tidak memakai kuota artifact)
+          echo "===== BARIS PENYEBAB ERROR ====="
+
+          if [ -f "$LOG" ]; then
+            grep -niE \
+              "AAPT|error:|ERROR|not found|What went wrong|Caused by|FAILURE:" \
+              "$LOG" | tail -80 || true
+          else
+            echo "build.log belum tersedia"
+          fi
+
+      # ==========================================
+      # 11. CARI HASIL APK
+      # ==========================================
+      - name: Cari hasil APK
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK_DIR="$PROJECT_DIR/app/build/outputs/apk"
+
+          if [ ! -d "$APK_DIR" ]; then
+            echo "ERROR: Folder APK tidak ditemukan"
+            exit 1
+          fi
+
+          find "$APK_DIR" -type f -name '*.apk' -print
+
+          APK=$(find "$APK_DIR" -type f -name '*.apk' | head -n1)
+
+          if [ -z "$APK" ]; then
+            echo "ERROR: APK tidak berhasil dibuat"
+            exit 1
+          fi
+
+          echo "APK_PATH=$APK" >> "$GITHUB_ENV"
+          echo "APK ditemukan: $APK"
+
+      # ==========================================
+      # 12. UPLOAD APK KE GITHUB RELEASE
+      # ==========================================
       - name: Upload APK ke Release
         if: success()
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          APK=$(ls "$PROJECT_DIR"/app/build/outputs/apk/*/*.apk | head -n1)
-          echo "APK: $APK"
-          gh release create "build-${{ github.run_number }}" "$APK" \
-            --title "War City build-${{ github.run_number }}" \
-            --notes "Build otomatis" --repo "$GITHUB_REPOSITORY"
+          set -euo pipefail
 
-      # Artifact tetap dicoba, tapi kalau kuota penuh build tidak dianggap gagal
-      - name: Upload APK ke Artifact (opsional)
+          TAG="sugester-build-${{ github.run_number }}"
+
+          if [ -z "${APK_PATH:-}" ] || [ ! -f "$APK_PATH" ]; then
+            echo "ERROR: APK tidak ditemukan"
+            exit 1
+          fi
+
+          gh release create "$TAG" "$APK_PATH" \
+            --title "Sugester $TAG" \
+            --notes "Sugester Android APK build otomatis." \
+            --repo "$GITHUB_REPOSITORY"
+
+      # ==========================================
+      # 13. UPLOAD APK ARTIFACT
+      # ==========================================
+      - name: Upload APK Artifact
         if: success()
-        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          name: BubbleAI-apk
-          retention-days: 1
-          if-no-files-found: warn
+          name: Sugester-APK
           path: |
-            ${{ env.PROJECT_DIR }}/app/build/outputs/apk/release/*.apk
-            ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
-            
+            ${{ env.PROJECT_DIR }}/app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
+          retention-days: 3
+
+      # ==========================================
+      # 14. UPLOAD LOG
+      # ==========================================
+      - name: Upload Build Log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sugester-build-log
+          path: build.log
+          if-no-files-found: warn
+          retention-days: 3
+          
