@@ -1,1 +1,289 @@
-Waiting for the user to confirm the requested GitHub workflow change.
+name: Build APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      obfuscate:
+        description: 'Acak & kecilkan kode dengan ProGuard/R8'
+        type: boolean
+        default: false
+      release:
+        description: 'Build release ditandatangani keystore pribadi (butuh Secrets)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Cari dan ekstrak ZIP
+        shell: bash
+        run: |
+          set -e
+
+          ZIP=$(find . -maxdepth 1 -type f -name '*.zip' | head -n1)
+
+          if [ -z "$ZIP" ]; then
+            echo "ERROR: ZIP tidak ditemukan di root repo"
+            exit 1
+          fi
+
+          mkdir -p work
+          unzip -q "$ZIP" -d work
+
+          SG=$(find work -maxdepth 6 \
+            \( -name settings.gradle -o -name settings.gradle.kts \) \
+            -type f | head -n1)
+
+          if [ -z "$SG" ]; then
+            echo "ERROR: settings.gradle tidak ditemukan di ZIP"
+            exit 1
+          fi
+
+          PROJECT_DIR="$(dirname "$SG")"
+          echo "PROJECT_DIR=$GITHUB_WORKSPACE/$PROJECT_DIR" >> "$GITHUB_ENV"
+
+          echo "Project ditemukan: $PROJECT_DIR"
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android SDK
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+          ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+        shell: bash
+        run: |
+          set -e
+
+          if [ ! -d "$ANDROID_HOME/cmdline-tools" ]; then
+            echo "ERROR: Folder cmdline-tools tidak ditemukan"
+            exit 1
+          fi
+
+          SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" \
+            -type f -name sdkmanager | head -n1)
+
+          if [ -z "$SDKMANAGER" ]; then
+            echo "ERROR: sdkmanager tidak ditemukan"
+            exit 1
+          fi
+
+          echo "Menggunakan: $SDKMANAGER"
+
+          yes | "$SDKMANAGER" --licenses || true
+
+          # Platform 34 WAJIB: sesuai compileSdk 34 di app/build.gradle
+          "$SDKMANAGER" --install \
+            "platform-tools" \
+            "platforms;android-34" \
+            "platforms;android-35" \
+            "build-tools;34.0.0" \
+            "build-tools;35.0.0"
+
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/build-tools/34.0.0" >> "$GITHUB_PATH"
+
+          # Pastikan Gradle menemukan SDK
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+
+          echo "Platform terpasang:"
+          ls "$ANDROID_HOME/platforms"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.2'
+
+      - name: Aktifkan ProGuard/R8 (opsional)
+        if: ${{ inputs.obfuscate == 'true' || inputs.obfuscate == true }}
+        shell: python3 {0}
+        run: |
+          import os, re, glob
+
+          project = os.environ["PROJECT_DIR"]
+          candidates = glob.glob(os.path.join(project, "app", "build.gradle")) + \
+                       glob.glob(os.path.join(project, "app", "build.gradle.kts"))
+          if not candidates:
+              raise SystemExit("ERROR: app/build.gradle(.kts) tidak ditemukan, lewati obfuscation")
+          path = candidates[0]
+          kts = path.endswith(".kts")
+          src = open(path, "r", encoding="utf-8").read()
+
+          pg_path = os.path.join(project, "app", "proguard-rules.pro")
+          STRICT_RULES = (
+              "-dontwarn **\n"
+              "-keep class * extends android.app.Activity\n"
+              "-keep class * extends android.app.Service\n"
+              "-keep class * extends android.content.BroadcastReceiver\n"
+              "-keep class * extends android.content.ContentProvider\n"
+              "-keepattributes *Annotation*\n"
+              "\n"
+              "# --- mode lebih ketat ---\n"
+              "-optimizationpasses 5\n"
+              "-allowaccessmodification\n"
+              "-repackageclasses ''\n"
+              "-overloadaggressively\n"
+              "-dontpreverify\n"
+              "-dontusemixedcaseclassnames\n"
+              "# buang info debug dari stack trace (nama file & nomor baris asli)\n"
+              "-renamesourcefileattribute SourceFile\n"
+              "-keepattributes !SourceFile,!LineNumberTable\n"
+              "# buang semua log saat runtime, bukan cuma disembunyikan\n"
+              "-assumenosideeffects class android.util.Log {\n"
+              "    public static *** d(...);\n"
+              "    public static *** v(...);\n"
+              "    public static *** i(...);\n"
+              "    public static *** w(...);\n"
+              "    public static *** e(...);\n"
+              "}\n"
+              "-assumenosideeffects class java.io.PrintStream {\n"
+              "    public void println(...);\n"
+              "    public void print(...);\n"
+              "}\n"
+          )
+          if os.path.exists(pg_path):
+              old = open(pg_path, "r", encoding="utf-8").read()
+              if "mode lebih ketat" not in old:
+                  with open(pg_path, "a", encoding="utf-8") as f:
+                      f.write("\n" + STRICT_RULES)
+                  print("Aturan ketat ditambahkan ke proguard-rules.pro yang sudah ada")
+          else:
+              with open(pg_path, "w", encoding="utf-8") as f:
+                  f.write(STRICT_RULES)
+              print("Dibuat: app/proguard-rules.pro (aturan ketat)")
+
+          m = re.search(r"buildTypes\s*\{", src)
+          if not m:
+              raise SystemExit("ERROR: blok buildTypes tidak ditemukan di " + path)
+
+          if kts:
+              addition = (
+                  "\n            isMinifyEnabled = true\n"
+                  "            isShrinkResources = true\n"
+                  "            isDebuggable = false\n"
+                  "            isJniDebuggable = false\n"
+                  "            proguardFiles(getDefaultProguardFile(\"proguard-android-optimize.txt\"), \"proguard-rules.pro\")\n        "
+              )
+              debug_block = re.search(r"debug\s*\{([^}]*)\}", src)
+              if debug_block:
+                  body = debug_block.group(1)
+                  if "isMinifyEnabled" not in body:
+                      src = src[:debug_block.start(1)] + body + addition + src[debug_block.end(1):]
+                  else:
+                      src = src.replace("isMinifyEnabled = false", "isMinifyEnabled = true", 1)
+                      src = re.sub(r"isDebuggable\s*=\s*true", "isDebuggable = false", src, count=1)
+              else:
+                  insert_at = m.end()
+                  snippet = "\n        debug {" + addition + "}\n"
+                  src = src[:insert_at] + snippet + src[insert_at:]
+          else:
+              addition = (
+                  "\n            minifyEnabled true\n"
+                  "            shrinkResources true\n"
+                  "            debuggable false\n"
+                  "            jniDebuggable false\n"
+                  "            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'\n        "
+              )
+              debug_block = re.search(r"debug\s*\{([^}]*)\}", src)
+              if debug_block:
+                  body = debug_block.group(1)
+                  if "minifyEnabled" not in body:
+                      src = src[:debug_block.start(1)] + body + addition + src[debug_block.end(1):]
+                  else:
+                      src = src.replace("minifyEnabled false", "minifyEnabled true", 1)
+                      src = re.sub(r"debuggable\s+true", "debuggable false", src, count=1)
+              else:
+                  insert_at = m.end()
+                  snippet = "\n        debug {" + addition + "}\n"
+                  src = src[:insert_at] + snippet + src[insert_at:]
+
+          open(path, "w", encoding="utf-8").write(src)
+          print("ProGuard/R8 mode ketat diaktifkan di:", path)
+
+          gp_path = os.path.join(project, "gradle.properties")
+          gp = open(gp_path, "r", encoding="utf-8").read() if os.path.exists(gp_path) else ""
+          need = []
+          if "android.enableR8.fullMode" not in gp:
+              need.append("android.enableR8.fullMode=true")
+          if "android.enableResourceOptimizations" not in gp:
+              need.append("android.enableResourceOptimizations=true")
+          if need:
+              with open(gp_path, "a", encoding="utf-8") as f:
+                  f.write("\n" + "\n".join(need) + "\n")
+              print("gradle.properties diperkuat:", need)
+
+      - name: Siapkan keystore release (hanya kalau release dipilih)
+        if: ${{ inputs.release == 'true' || inputs.release == true }}
+        shell: bash
+        env:
+          KS_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+        run: |
+          set -e
+          if [ -z "$KS_BASE64" ]; then
+            echo "ERROR: Secret RELEASE_KEYSTORE_BASE64 belum diisi di repo (Settings > Secrets and variables > Actions)."
+            exit 1
+          fi
+          echo "$KS_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          echo "RELEASE_KS_PATH=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+
+      - name: Build APK
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          RELEASE_KEYSTORE_PATH: ${{ env.RELEASE_KS_PATH }}
+          RELEASE_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          set -eo pipefail
+          if [ "${{ inputs.release }}" = "true" ]; then
+            gradle assembleRelease --stacktrace --console=plain 2>&1 | tee "$RUNNER_TEMP/build.log"
+          else
+            gradle assembleDebug --stacktrace --console=plain 2>&1 | tee "$RUNNER_TEMP/build.log"
+          fi
+
+      - name: Tampilkan ringkasan error (kalau build gagal)
+        if: failure()
+        shell: bash
+        run: |
+          echo "===== Baris penyebab error (AAPT / error: / not found) ====="
+          grep -nE "AAPT|error:|ERROR|not found|What went wrong|Caused by" "$RUNNER_TEMP/build.log" | head -60 || true
+
+      # APK dikirim ke tab Releases (tidak memakai kuota artifact)
+      - name: Upload APK ke Release
+        if: success()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          APK=$(ls "$PROJECT_DIR"/app/build/outputs/apk/*/*.apk | head -n1)
+          echo "APK: $APK"
+          gh release create "build-${{ github.run_number }}" "$APK" \
+            --title "War City build-${{ github.run_number }}" \
+            --notes "Build otomatis" --repo "$GITHUB_REPOSITORY"
+
+      # Artifact tetap dicoba, tapi kalau kuota penuh build tidak dianggap gagal
+      - name: Upload APK ke Artifact (opsional)
+        if: success()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: BubbleAI-apk
+          retention-days: 1
+          if-no-files-found: warn
+          path: |
+            ${{ env.PROJECT_DIR }}/app/build/outputs/apk/release/*.apk
+            ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
+            
