@@ -50,6 +50,149 @@ jobs:
 
           echo "Project ditemukan: $PROJECT_DIR"
 
+      # Sertakan paket QEMU ke dalam APK agar pengguna tidak perlu impor file apa pun.
+      # Kalau langkah ini gagal, APK tetap dibuat (QEMU bisa diimpor manual).
+      - name: Siapkan paket QEMU (dimasukkan ke assets APK)
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -e
+          sudo apt-get install -y dpkg || true
+          cat > pack.py <<'PY'
+          import os, re, sys, shutil, subprocess, urllib.request, gzip, lzma, zipfile
+
+          BASE = "https://packages.termux.dev/apt/termux-main"
+          ARCH = "aarch64"
+
+          def fetch(url):
+              req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+              with urllib.request.urlopen(req, timeout=180) as r:
+                  return r.read()
+
+          def load_index():
+              for name, dec in (("Packages.xz", lzma.decompress), ("Packages.gz", gzip.decompress), ("Packages", lambda b: b)):
+                  try:
+                      data = dec(fetch(f"{BASE}/dists/stable/main/binary-{ARCH}/{name}"))
+                      print("index:", name, len(data), "bytes")
+                      return data.decode("utf-8", "replace")
+                  except Exception as e:
+                      print("gagal", name, e)
+              sys.exit("Index paket Termux tidak bisa diunduh")
+
+          pk = {}
+          for block in load_index().split("\n\n"):
+              d = {}
+              for line in block.splitlines():
+                  if ": " in line and not line.startswith(" "):
+                      k, v = line.split(": ", 1)
+                      d[k] = v
+              if "Package" in d:
+                  pk[d["Package"]] = d
+
+          cands = sorted(n for n in pk if re.match(r"qemu-system-x86", n))
+          print("kandidat:", cands)
+          if "qemu-system-x86-64" in pk:
+              target = "qemu-system-x86-64"
+          elif cands:
+              target = cands[0]
+          else:
+              sys.exit("Paket qemu-system-x86-64 tidak ada di index Termux")
+
+          want = [target] + [n for n in ("qemu-utils", "qemu-common") if n in pk]
+          SKIP = {"termux-exec", "termux-tools", "termux-keyring", "termux-licenses", "apt", "dpkg", "bash", "coreutils", "dash", "busybox", "procps", "util-linux"}
+
+          def deps(name):
+              out = []
+              for part in pk[name].get("Depends", "").split(","):
+                  part = part.strip()
+                  if not part:
+                      continue
+                  alt = part.split("|")[0].strip()
+                  alt = re.sub(r"\s*\(.*\)", "", alt).strip()
+                  out.append(alt)
+              return out
+
+          need, seen, stack = [], set(), list(want)
+          while stack:
+              n = stack.pop()
+              if n in seen or n in SKIP:
+                  continue
+              seen.add(n)
+              if n not in pk:
+                  print("peringatan: tidak ada di index:", n)
+                  continue
+              need.append(n)
+              stack.extend(deps(n))
+          print("paket:", need)
+
+          os.makedirs("debs", exist_ok=True)
+          shutil.rmtree("ex", ignore_errors=True)
+          os.makedirs("ex")
+          for n in need:
+              fn = pk[n]["Filename"]
+              path = os.path.join("debs", os.path.basename(fn))
+              with open(path, "wb") as f:
+                  f.write(fetch(f"{BASE}/{fn}"))
+              subprocess.check_call(["dpkg-deb", "-x", path, "ex"])
+
+          usr = "ex/data/data/com.termux/files/usr"
+          stage = "stage"
+          shutil.rmtree(stage, ignore_errors=True)
+          for sub in ("bin", "lib", "share"):
+              os.makedirs(os.path.join(stage, sub))
+
+          for b in os.listdir(f"{usr}/bin"):
+              if b.startswith("qemu-"):
+                  try:
+                      shutil.copy2(f"{usr}/bin/{b}", f"{stage}/bin/{b}")
+                  except Exception as e:
+                      print("lewati", b, e)
+
+          for root, dirs, files in os.walk(f"{usr}/lib"):
+              rel = os.path.relpath(root, f"{usr}/lib")
+              top = rel.split(os.sep)[0]
+              if rel != "." and top != "qemu":
+                  dirs[:] = []
+                  continue
+              for f in files:
+                  if ".so" in f:
+                      dst = os.path.join(stage, "lib", rel if rel != "." else "")
+                      os.makedirs(dst, exist_ok=True)
+                      try:
+                          shutil.copy2(os.path.join(root, f), os.path.join(dst, f))
+                      except Exception as e:
+                          print("lewati", f, e)
+
+          EX = ("edk2", "skiboot", "u-boot", "s390", "opensbi", "openbios", "petalogix", "palcode", "hppa", "slof", "vof", "npcm", "canyonlands", "bamboo", "trace", "qemu-nsis")
+          src = f"{usr}/share/qemu"
+          if os.path.isdir(src):
+              shutil.copytree(src, f"{stage}/share/qemu", dirs_exist_ok=True,
+                              ignore=lambda d, names: [x for x in names if x.startswith(EX)],
+                              ignore_dangling_symlinks=True)
+          else:
+              print("peringatan: share/qemu tidak ditemukan")
+
+          for need_file in ("bin/qemu-system-x86_64", "share/qemu/bios-256k.bin"):
+              print(need_file, "OK" if os.path.exists(os.path.join(stage, need_file)) else "TIDAK ADA")
+          if not os.path.exists(os.path.join(stage, "bin/qemu-system-x86_64")):
+              sys.exit("qemu-system-x86_64 tidak ada di hasil ekstrak")
+
+          with open(os.path.join(stage, "VERSIONS.txt"), "w") as f:
+              for n in need:
+                  f.write(f"{n} {pk[n].get('Version','?')}\n")
+
+          with zipfile.ZipFile("qemu-android-arm64.zip", "w", zipfile.ZIP_DEFLATED) as z:
+              for root, _, files in os.walk(stage):
+                  for f in files:
+                      p = os.path.join(root, f)
+                      z.write(p, os.path.relpath(p, stage))
+          print("ukuran zip:", os.path.getsize("qemu-android-arm64.zip") // 1048576, "MB")
+          PY
+          python3 pack.py
+          mkdir -p "$PROJECT_DIR/app/src/main/assets"
+          cp qemu-android-arm64.zip "$PROJECT_DIR/app/src/main/assets/qemu-android-arm64.zip"
+          ls -la "$PROJECT_DIR/app/src/main/assets/"
+
       - name: Setup Java
         uses: actions/setup-java@v5
         with:
